@@ -1,0 +1,307 @@
+// Copyright 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#pragma once
+
+#include <google/protobuf/any.pb.h>
+#include <stdint.h>
+
+#include <algorithm>
+#include <type_traits>
+
+#include "model_config.pb.h"
+
+namespace triton { namespace common {
+
+/// The type for a repeated dims field (used for shape).
+using DimsList = ::google::protobuf::RepeatedField<::google::protobuf::int64>;
+
+/// The type for the metric_tags map.
+using MetricTagsMap = ::google::protobuf::Map<std::string, std::string>;
+
+// Map from a host policy name to <setting, value> map of cmdline
+// settings for the host policy.
+using HostPolicyCmdlineConfig = std::map<std::string, std::string>;
+using HostPolicyCmdlineConfigMap =
+    std::unordered_map<std::string, HostPolicyCmdlineConfig>;
+
+// Map from backend name to list of setting=value pairs of cmdline
+// settings for the backend.
+using BackendCmdlineConfig = std::vector<std::pair<std::string, std::string>>;
+using BackendCmdlineConfigMap =
+    std::unordered_map<std::string, BackendCmdlineConfig>;
+
+/// Special values used for dimensions and element counts.
+/// WILDCARD_DIM / WILDCARD_SIZE uses -1.
+/// OVERFLOW_SIZE uses -3 instead of -2 so that -2 remains available as a
+/// reserved value for potential future use without changing the meaning of
+/// existing negative return codes.
+constexpr int WILDCARD_DIM = -1;
+constexpr int WILDCARD_SIZE = -1;
+constexpr int INVALID_SIZE = -2;
+constexpr int OVERFLOW_SIZE = -3;
+constexpr int SCHEDULER_DEFAULT_NICE = 5;
+
+/// Enumeration for the different platform types.
+enum Platform {
+  PLATFORM_UNKNOWN = 0,
+  PLATFORM_TENSORRT_PLAN = 1,
+  PLATFORM_TENSORFLOW_GRAPHDEF = 2,
+  PLATFORM_TENSORFLOW_SAVEDMODEL = 3,
+  PLATFORM_ENSEMBLE = 4,
+  PLATFORM_ONNXRUNTIME_ONNX = 5,
+  PLATFORM_PYTORCH_LIBTORCH = 6
+};
+
+/// Get the number of elements in a shape.
+/// \param dims The shape.
+/// \return The number of elements, or
+/// -1 if the number of elements cannot be determined because the shape
+/// contains one or more wildcard dimensions,
+/// -2 if the shape contains an invalid dimension,
+/// -3 if the number is too large to represent as an int64_t.
+template <typename T>
+std::enable_if_t<
+    std::is_same_v<T, DimsList> || std::is_same_v<T, std::vector<int64_t>>,
+    int64_t>
+GetElementCount(const T& dims)
+{
+  bool first = true;
+  int64_t cnt = 0;
+  for (auto dim : dims) {
+    if (dim == WILDCARD_DIM) {
+      return WILDCARD_SIZE;
+    } else if (dim < 0) {
+      return INVALID_SIZE;  // invalid dim
+    }
+
+    if (first) {
+      cnt = dim;
+      first = false;
+    } else if (dim != 0 && cnt > INT64_MAX / dim) {
+      return OVERFLOW_SIZE;
+    } else {
+      cnt *= dim;
+    }
+  }
+
+  return cnt;
+}
+
+/// Get the number of elements in the shape of a model input.
+/// \param mio The model input.
+/// \return The number of elements, or
+/// -1 if the number of elements cannot be determined because the shape
+/// contains one or more wildcard dimensions,
+/// -2 if the shape contains an invalid dimension,
+/// -3 if the number is too large to represent as an int64_t.
+template <typename T>
+std::enable_if_t<
+    std::is_same_v<T, inference::ModelInput> ||
+        std::is_same_v<T, inference::ModelOutput>,
+    int64_t>
+GetElementCount(const T& mio)
+{
+  return GetElementCount(mio.dims());
+}
+
+/// Are values of a datatype fixed-size, or variable-sized.
+/// \param dtype The data-type.
+/// \return True if datatype values are fixed-sized, false if
+/// variable-sized.
+bool IsFixedSizeDataType(const inference::DataType dtype);
+
+/// Get the size of objects of a given datatype in bytes.
+/// \param dtype The data-type.
+/// \return The size, in bytes, of objects of the datatype, or 0 if
+/// size cannot be determine (for example, values of type TYPE_STRING
+/// have variable length and so size cannot be determine just from the
+/// type).
+size_t GetDataTypeByteSize(const inference::DataType dtype);
+
+/// Get the size, in bytes, of a tensor based on datatype and
+/// shape.
+/// \param dtype The data-type.
+/// \param dims The shape.
+/// \return The size, in bytes, of the corresponding tensor, or
+/// -1 if unable to determine the size,
+/// -2 if the shape contains an invalid dimension,
+/// -3 if the number is too large to represent as an int64_t.
+template <
+    typename T,
+    typename = std::enable_if_t<
+        std::is_same_v<T, DimsList> || std::is_same_v<T, std::vector<int64_t>>>>
+int64_t
+GetByteSize(const inference::DataType& dtype, const T& dims)
+{
+  size_t dt_size = GetDataTypeByteSize(dtype);
+  if (dt_size == 0) {
+    return WILDCARD_SIZE;
+  }
+
+  int64_t cnt = GetElementCount(dims);
+  if (cnt == WILDCARD_SIZE) {
+    return WILDCARD_SIZE;
+  } else if (cnt == INVALID_SIZE) {
+    return INVALID_SIZE;  // invalid dim
+  } else if (
+      cnt == OVERFLOW_SIZE || cnt > INT64_MAX / static_cast<int64_t>(dt_size)) {
+    return OVERFLOW_SIZE;
+  }
+
+  return cnt * dt_size;
+}
+
+/// Get the size, in bytes, of a tensor based on batch-size, datatype
+/// and shape. A tensor that has empty shape [] and non-zero
+/// batch-size is sized as a tensor with shape [ batch-size ].
+/// \param batch_size The batch-size. May be 0 to indicate no
+/// batching.
+/// \param dtype The data-type.
+/// \param dims The shape.
+/// \return The size, in bytes, of the corresponding tensor, or
+/// -1 if unable to determine the size,
+/// -2 if the shape contains an invalid dimension,
+/// -3 if the number is too large to represent as an int64_t.
+template <
+    typename T,
+    typename = std::enable_if_t<
+        std::is_same_v<T, DimsList> || std::is_same_v<T, std::vector<int64_t>>>>
+int64_t
+GetByteSize(
+    const int batch_size, const inference::DataType& dtype, const T& dims)
+{
+  if (dims.size() == 0) {
+    return batch_size * GetDataTypeByteSize(dtype);
+  }
+
+  int64_t bs = GetByteSize(dtype, dims);
+  if (bs == WILDCARD_SIZE) {
+    return WILDCARD_SIZE;
+  } else if (bs == INVALID_SIZE) {
+    return INVALID_SIZE;  // invalid dim
+  } else if (
+      bs == OVERFLOW_SIZE ||
+      (bs != 0 && std::max(1, batch_size) > INT64_MAX / bs)) {
+    return OVERFLOW_SIZE;
+  }
+
+  return std::max(1, batch_size) * bs;
+}
+
+/// Get the size, in bytes, of a tensor based on ModelInput.
+/// \param mio The ModelInput protobuf.
+/// \return The size, in bytes, of the corresponding tensor, or
+/// -1 if unable to determine the size,
+/// -2 if the shape contains an invalid dimension,
+/// -3 if the number is too large to represent as an int64_t.
+template <
+    typename T, typename = std::enable_if_t<
+                    std::is_same_v<T, inference::ModelInput> ||
+                    std::is_same_v<T, inference::ModelOutput>>>
+int64_t
+GetByteSize(const T& mio)
+{
+  return GetByteSize(mio.data_type(), mio.dims());
+}
+
+/// Get the CPU thread nice level associate with a model
+/// configuration's priority.
+/// \param config The model configuration.
+/// \return The nice level.
+int GetCpuNiceLevel(const inference::ModelConfig& config);
+
+/// Compare two model configuration shapes for equality. Wildcard
+/// dimensions (that is, dimensions with size WILDCARD_DIM) are
+/// compared literally so that to be equal the two shapes must both
+/// specify WILDCARD_DIM in the same dimensions.
+/// \params dims0 The first shape.
+/// \params dims1 The second shape.
+/// \return True if the shapes are equal, false if not equal.
+bool CompareDims(const DimsList& dims0, const DimsList& dims1);
+
+/// Compare two model configuration shapes for equality. Wildcard
+/// dimensions (that is, dimensions with size WILDCARD_DIM) are
+/// compared literally so that to be equal the two shapes must both
+/// specify WILDCARD_DIM in the same dimensions.
+/// \params dims0 The first shape.
+/// \params dims1 The second shape.
+/// \return True if the shapes are equal, false if not equal.
+bool CompareDims(
+    const std::vector<int64_t>& dims0, const std::vector<int64_t>& dims1);
+
+/// Compare two model configuration shapes for equality. Wildcard
+/// dimensions (that is, dimensions with size WILDCARD_DIM) are
+/// allowed to match with any value. So, a dimension in one shape
+/// specified as WILDCARD_DIM will always match the same dimension in
+/// the other shape.
+/// \params dims0 The first shape.
+/// \params dims1 The second shape.
+/// \return True if the shapes are equal, false if not equal.
+bool CompareDimsWithWildcard(const DimsList& dims0, const DimsList& dims1);
+
+/// Compare two model configuration shapes for equality. Wildcard
+/// dimensions (that is, dimensions with size WILDCARD_DIM) are
+/// allowed to match with any value. So, a dimension in one shape
+/// specified as WILDCARD_DIM will always match the same dimension in
+/// the other shape.
+/// \params dims0 The first shape.
+/// \params dims1 The second shape.
+/// \return True if the shapes are equal, false if not equal.
+bool CompareDimsWithWildcard(
+    const DimsList& dims0, const std::vector<int64_t>& dims1);
+
+/// Convert a DimsList to string representation.
+/// \param dims The DimsList to be converted.
+/// \return String representation of the DimsList in pattern
+/// "[d0,d1,...,dn]"
+std::string DimsListToString(const DimsList& dims);
+
+/// Convert a vector representing a shape to string representation.
+/// \param dims The vector of dimensions to be converted.
+/// \return String representation of the vector in pattern
+/// "[d0,d1,...,dn]"
+std::string DimsListToString(
+    const std::vector<int64_t>& dims, const int start_idx = 0);
+
+/// Get the server protocol string representation of a datatype.
+/// \param dtype The data type.
+/// \return The string representation.
+const char* DataTypeToProtocolString(const inference::DataType dtype);
+
+/// Get the datatype corresponding to a server protocol string
+/// representation of a datatype.
+/// \param dtype string representation.
+/// \return The data type.
+inference::DataType ProtocolStringToDataType(const std::string& dtype);
+
+/// Get the datatype corresponding to a server protocol string
+/// representation of a datatype.
+/// \param dtype Pointer to string.
+/// \param len Length of the string.
+/// \return The data type.
+inference::DataType ProtocolStringToDataType(const char* dtype, size_t len);
+
+}}  // namespace triton::common
