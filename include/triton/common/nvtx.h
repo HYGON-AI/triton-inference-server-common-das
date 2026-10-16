@@ -27,10 +27,18 @@
 
 #ifdef TRITON_ENABLE_NVTX
 
+#if USE_HCU
+// HCU/HIP port: use ROCm roctx (roctracer) API instead of NVIDIA NVTX.
+// roctx provides nested range push/pop and markers, keeping the same
+// NvtxRange / NVTX_RANGE / NVTX_MARKER external interface for callers.
+#include <roctx.h>
+#else
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 namespace triton { namespace common {
 
+#if(!USE_HCU)
 namespace detail {
 
 class NvtxTritonDomain {
@@ -50,14 +58,19 @@ class NvtxTritonDomain {
 };
 
 }  // namespace detail
+#endif
 
 // Updates a server stat with duration measured by a C++ scope.
 class NvtxRange {
  public:
   explicit NvtxRange(const char* label, uint32_t rgb = kNvGreen)
   {
+#if USE_HCU
+    roctxRangePush(label);
+#else
     auto attr = GetAttributes(label, rgb);
     nvtxDomainRangePushEx(detail::NvtxTritonDomain::GetDomain(), &attr);
+#endif
   }
 
   explicit NvtxRange(const std::string& label, uint32_t rgb = kNvGreen)
@@ -65,7 +78,13 @@ class NvtxRange {
   {
   }
 
-  ~NvtxRange() { nvtxDomainRangePop(detail::NvtxTritonDomain::GetDomain()); }
+  ~NvtxRange() {
+#if USE_HCU
+     roctxRangePop(); 
+#else
+     nvtxDomainRangePop(detail::NvtxTritonDomain::GetDomain());
+#endif
+ }
 
   static constexpr uint32_t kNvGreen = 0x76b900;
   static constexpr uint32_t kRed = 0xc1121f;
@@ -74,6 +93,7 @@ class NvtxRange {
   static constexpr uint32_t kYellow = 0xffb703;
   static constexpr uint32_t kOrange = 0xfb8500;
 
+#if(!USE_HCU)
  private:
   nvtxEventAttributes_t GetAttributes(const char* label, uint32_t rgb)
   {
@@ -86,6 +106,7 @@ class NvtxRange {
     attr.message.ascii = label;
     return attr;
   }
+#endif
 };
 
 }}  // namespace triton::common
@@ -97,10 +118,18 @@ class NvtxRange {
 // For `NVTX_RANGE` macro please refer to the usage below.
 //
 #ifdef TRITON_ENABLE_NVTX
+#if USE_HCU
+#define NVTX_INITIALIZE
+#else
 #define NVTX_INITIALIZE nvtxInitialize(nullptr)
+#endif
 #define NVTX_RANGE1(V, L) triton::common::NvtxRange V(L)
 #define NVTX_RANGE2(V, L, RGB) triton::common::NvtxRange V(L, RGB)
+#if USE_HCU
+#define NVTX_MARKER(L) roctxMark(L)
+#else
 #define NVTX_MARKER(L) nvtxMarkA(L)
+#endif
 #else
 #define NVTX_INITIALIZE
 #define NVTX_RANGE1(V, L)
